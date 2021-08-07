@@ -1,0 +1,1421 @@
+---
+title: "MITB Capstone Project"
+author: 'Jasper Lok (Supervisor: Professor Kam Tin Seong)'
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    toc_collapsed: yes
+    highlight: tango
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+subtitle: 'When 1 + 1 > 2: How Modern Data Science Could Complement Actuarial Science
+  in Claim Cost Estimation - Supervised Learning Methods'
+---
+
+# 1 Getting Started
+## 1.1 Setup the R environment for the analysis later
+
+```{r, eval = FALSE, include = FALSE}
+# IMPORTANT NOTE
+# The running time for this entire script is very long. It takes more than 5 hours to finish running
+# Subset the data if want to shorten the run time
+
+```
+
+```{r setup environment, message = FALSE, warning = FALSE}
+packages <- c('tidyverse', 'funModeling', 'tidymodels', 'doParallel', 'lubridate', 'usemodels', 'ranger', 'vip', 'pdp', 'iml', 'skimr', 'plotly', 'ggpubr', 'stacks', 'ggExtra', 'ggpointdensity', 'textrecipes', 'rules', 'xrf', 'MASS', 'olsrr', 'rstanarm')
+
+for (p in packages){
+  if(!require (p, character.only = T)){
+    install.packages(p)
+  }
+  library(p, character.only = T)
+}
+
+```
+
+## 1.2 Call the relevant dataset
+
+First read in the data as the master data and ensure the variables are read in correct data types.
+
+```{r}
+df_base <- read_csv("data/data_eda_actLoss_3.csv") %>%
+  dplyr::select(-c(ClaimNumber,
+                   num_week_paid_ult)) %>%
+  dplyr::select(-starts_with(c("acc", "report"))) %>%
+  filter(Gender != "U") %>%
+  drop_na() %>%
+  sample_frac(0.3)
+
+```
+
+Next, from the master data, create the relevant sets for the model building later.
+
+```{r}
+# Dataset for models with pre-text mining during EDA stage
+df <- df_base %>%
+  dplyr::select(-c(ClaimDescription, UltimateIncurredClaimCost, InitialIncurredClaimCost))
+
+```
+
+```{r}
+# Dataset for building sub models based on the number of week paid initial estimated
+df_less20wk <- df_base %>%
+  filter(num_week_paid_init < 20) %>%
+  dplyr::select(-c(ClaimDescription, UltimateIncurredClaimCost, InitialIncurredClaimCost))
+
+df_more20wk <- df_base %>%
+  filter(num_week_paid_init >= 20) %>%
+  dplyr::select(-c(ClaimDescription, UltimateIncurredClaimCost, InitialIncurredClaimCost))
+
+```
+
+```{r}
+# Dataset for direct modeling on text fields
+df_wClmDesc <- df_base %>%
+  dplyr::select(-c(UltimateIncurredClaimCost, InitialIncurredClaimCost)) %>%
+  dplyr::select(-starts_with("injury_"))
+```
+
+```{r}
+# Dataset for predicting on the ultimate claim cost directly
+df_ult <- df_base %>%
+  dplyr::select(-c(init_ult_diff, ClaimDescription))
+
+```
+
+
+Also, to compare the model results if outliers are not removed
+
+```{r}
+df_org <- read_csv("data/actuarial_loss_train.csv") %>%
+  dplyr::select(-c(ClaimNumber)) %>%
+  filter(Gender != "U") %>%
+  drop_na()
+
+```
+
+
+## 1.3 Define the relevant parameters for the analysis
+
+```{r}
+# Define the random seeds for reproducibility
+set.seed(123)
+
+# Proportion between training and testing dataset
+prop_train_test <- 0.6
+
+# Define the model performance metrics we would like to output later
+model_metrics <- metric_set(rmse, rsq, mase)
+
+# Number of grid for k-fold validation
+num_grid <- 5
+
+# Set the parameters on how many variables to extract for variable importance
+vip_var_num <- 10
+
+# List of models will be fitted in this analysis
+model_list <- c("ranger", "earth", "glmnet", "xgboost", "kknn")
+
+# List of models to extract out the variable importance
+# Note that kknn doesn't have variable importance, hence its being removed from the list
+vip_model_list <- model_list %>%
+  purrr::discard(.p = ~stringr::str_detect(.x, "kknn"))
+
+```
+
+
+## 1.4 Register the number of cores for parallel computing
+
+```{r}
+registerDoParallel() #as many physical cores as available.
+
+```
+
+
+## 1.5 Data splitting
+
+To compare the accuracy across different models, the dataset is split into training and testing dataset. Training dataset will be used to train the models and the models will be used to perform prediction on the testing dataset. 
+
+Cross validation will be performed to ensure the models are not overfitted.
+
+First, I will perform pre-processing on the dataset before splitting the data.
+
+
+```{r}
+# Dataset with pre-text mining during EDA stage
+df_split <- initial_split(df,
+                            prop = prop_train_test,
+                            strata = init_ult_diff)
+
+df_train <- training(df_split)
+df_test <- testing(df_split)
+
+df_folds <- vfold_cv(df_train, strata = init_ult_diff)
+df_folds 
+
+```
+
+
+Then, I will define the general recipe for the different machine learning models.
+
+```{r}
+gen_recipe <- recipe(init_ult_diff ~ ., data = df_train) %>%
+  step_date(c(DateTimeOfAccident, DateReported)) %>%
+  step_mutate(DateTimeOfAccident_hr = lubridate::hour(DateTimeOfAccident),
+              DateTimeOfAccident_hr = factor(DateTimeOfAccident_hr, order = TRUE),
+              DateTimeOfAccident_year = factor(DateTimeOfAccident_year, order = TRUE),
+              DateReported_year = factor(DateReported_year, order = TRUE)) %>%
+  update_role(c(DateTimeOfAccident, DateReported), new_role = "id") %>% # update the roles of original date variables to "id"
+  prep()
+
+# Apply the pre-processing on new dataset
+df_less20wk <- bake(gen_recipe, new_data = NULL)
+df_more20wk <- bake(gen_recipe, new_data = NULL)
+
+
+```
+
+
+**Summary** function is used to check the data type to ensure they are in the correct data type before building machine learning models.
+
+
+```{r}
+gen_recipe %>% summary()
+
+```
+
+
+Perform the necessary data splitting & cross validation for the remaining of the dataset.
+
+```{r}
+# Dataset for sub models building
+# Less than 20 weeks paid initially estimated
+df_less20wk_split <- initial_split(df_less20wk,
+                            prop = prop_train_test,
+                            strata = init_ult_diff)
+
+df_less20wk_train <- training(df_less20wk_split)
+df_less20wk_test <- testing(df_less20wk_split)
+
+df_less20wk_folds <- vfold_cv(df_less20wk_train, 
+                              strata = init_ult_diff)
+
+df_less20wk_folds
+
+# More than 20 weeks paid initially estimated
+df_more20wk_split <- initial_split(df_more20wk,
+                            prop = prop_train_test,
+                            strata = init_ult_diff)
+
+df_more20wk_train <- training(df_more20wk_split)
+df_more20wk_test <- testing(df_more20wk_split)
+
+df_more20wk_folds <- vfold_cv(df_more20wk_train, 
+                              strata = init_ult_diff)
+
+df_more20wk_folds
+
+```
+
+
+
+```{r}
+# Dataset with claim descriptions
+df_wClmDesc_split <- initial_split(df_wClmDesc,
+                            prop = prop_train_test,
+                            strata = init_ult_diff)
+
+df_wClmDesc_train <- training(df_wClmDesc_split)
+df_wClmDesc_test <- testing(df_wClmDesc_split)
+
+df_wClmDesc_folds <- vfold_cv(df_wClmDesc_train, strata = init_ult_diff)
+df_wClmDesc_folds
+
+```
+
+
+
+```{r}
+# Dataset with ultimate claim amount
+df_ult_split <- initial_split(df_ult,
+                            prop = prop_train_test,
+                            strata = UltimateIncurredClaimCost)
+
+df_ult_train <- training(df_ult_split)
+df_ult_test <- testing(df_ult_split)
+
+df_ult_folds <- vfold_cv(df_ult_train, strata = UltimateIncurredClaimCost)
+df_ult_folds
+
+```
+
+
+```{r}
+# Orginal Dataset
+df_org_split <- initial_split(df_org,
+                            prop = prop_train_test,
+                            strata = UltimateIncurredClaimCost)
+
+df_org_train <- training(df_org_split)
+df_org_test <- testing(df_org_split)
+
+df_org_folds <- vfold_cv(df_org_train, strata = UltimateIncurredClaimCost)
+df_org_folds
+
+```
+
+
+
+
+
+# 2 Model Building
+
+Here we will start building our models. The unified functions make it easy for the users to use various models for machine learning.
+
+The unified functions also allows us to reuse the same functions for different models.
+
+Note that **step_date** function doesn't seem to support extraction of time (eg. hour, minutes) according to their online documentation. Therefore, I will further use **step_mutate** function to extract other information. **step_mutate** function allows us to tap on the **mutate** function in **dplyr** package to perform necessary analysis.
+
+
+
+## 2.1 Without claim descriptions
+
+### 2.1.1 Random Forest
+
+Here, I will be using different **Tidymodels** packages in building machine learning models. Note the I have leveraged on **user_model** package to generate the templates for model building. The advantages of using such package is the package can generate the model building & tuning templates for commonly used models. The generated template also includes the recommended data pre-processing steps, which makes it easier for the users.
+
+
+**Step 1:** we will define the "recipe", which I will specify the dependent variable and training dataset. 
+
+
+```{r}
+# Step 1
+ranger_recipe <- gen_recipe
+
+```
+
+**Step 2:** I will indicate some of the model info, such as which R package I am using to build the random forest, what type of model I am building over here (i.e. regression or classification), parameters to be tuned and so on.
+
+
+```{r}
+# Step 2
+ranger_spec <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 50) %>% 
+  set_mode("regression") %>% 
+  set_engine("ranger", importance = "impurity")
+
+```
+
+**Step 3:** In this step, I have "chained" the different parts of the machine learning models together as a workflow. The purpose of doing so is to allow us to reuse the same recipe and model specs later in the analysis.
+
+
+```{r}
+# Step 3
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe) %>% 
+  add_model(ranger_spec) 
+
+```
+
+**Step 4:** Then, we perform model tuning on the cross validation dataset we created earlier.
+
+
+```{r}
+# Step 4
+set.seed(51107)
+ranger_tune <-
+  tune_grid(ranger_workflow, 
+            resamples = df_folds, 
+            grid = num_grid)
+
+```
+
+**Step 5:**: Once the parameters are tuned, the best model paramters is selected by using **select_best** function as shown below. I have also finalised the workflow so that I can perform predictions on testing data through **last_fit** function.
+
+
+```{r}
+# Step 5
+ranger_final_wf <- ranger_workflow %>%
+  finalize_workflow(select_best(ranger_tune))
+
+ranger_fit <- ranger_final_wf %>%
+  last_fit(df_split)
+
+```
+
+**Step 6:** To facilitate the model comparison later on, I have collected the predictions and calculated the different model performance metrics.
+
+
+```{r}
+# Step 6
+ranger_pred <- ranger_fit %>%
+  collect_predictions()
+
+ranger_metric <- model_metrics(ranger_pred, 
+                               truth = init_ult_diff, 
+                               estimate = .pred) %>%
+  mutate(model = "ranger") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+
+Next, I will be following the same steps as per what I have described under random forest to build different machine learning models (eg. XGBoost, neural network etc) for model comparison.
+
+
+### 2.1.2 Multivariate Adaptive Regression Splines (MARS)
+
+As **tidymodels** allows us to modularise the different model components, we can effectively reuse the different model components.
+
+
+Note that the interface for different model components look broadly the same, flattening the learning curve for the users to use the various models in performing machine learning tasks.
+
+
+```{r}
+earth_recipe <- gen_recipe %>% 
+  step_novel(all_nominal(), -all_outcomes()) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors()) 
+
+earth_spec <- 
+  mars(num_terms = tune(), prod_degree = tune(), prune_method = "none") %>% 
+  set_mode("regression") %>% 
+  set_engine("earth") 
+
+earth_workflow <- 
+  workflow() %>% 
+  add_recipe(earth_recipe) %>% 
+  add_model(earth_spec) 
+
+earth_grid <- tidyr::crossing(num_terms = 2 * (1:6), prod_degree = 1:2) 
+
+earth_tune <- 
+  tune_grid(earth_workflow, resamples = df_folds, grid = earth_grid)
+
+earth_fit <- earth_workflow %>%
+  finalize_workflow(select_best(earth_tune)) %>%
+  last_fit(df_split)
+
+earth_pred <- earth_fit %>%
+  collect_predictions()
+
+earth_metric <- model_metrics(earth_pred, 
+                               truth = init_ult_diff, 
+                               estimate = .pred) %>%
+  mutate(model = "earth") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+
+```
+
+
+
+### 2.1.3 Generalised Linear Model (GLM)
+
+I have also fitted a GLM model below.
+
+```{r}
+glmnet_recipe <- gen_recipe %>%
+  step_dummy(all_nominal())
+
+glmnet_spec <- 
+  linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet") 
+
+glmnet_workflow <- 
+  workflow() %>% 
+  add_recipe(glmnet_recipe) %>%
+  add_model(glmnet_spec) 
+
+glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20), mixture = c(0.05, 
+    0.2, 0.4, 0.6, 0.8, 1)) 
+
+glmnet_tune <- 
+  tune_grid(glmnet_workflow, resamples = df_folds, grid = glmnet_grid) 
+
+glmnet_fit <- glmnet_workflow %>%
+  finalize_workflow(select_best(glmnet_tune, "rmse")) %>%
+  last_fit(df_split)
+
+glmnet_pred <- glmnet_fit %>%
+  collect_predictions()
+
+glmnet_metric <- model_metrics(glmnet_pred, 
+                               truth = init_ult_diff, 
+                               estimate = .pred) %>%
+  mutate(model = "glmnet") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+
+```
+
+
+### 2.1.4 Linear regression
+
+To contrast the GLM (with Gaussian as link function) results above, I have also fitted a multiple regression model.
+
+```{r}
+#lm_recipe <- recipe(formula = init_ult_diff ~ ., data = df_train)
+
+lm_spec <- linear_reg() %>%
+  set_mode("regression") %>%
+  set_engine("lm")
+
+lm_fit <- fit(lm_spec, init_ult_diff ~ ., df_train)
+
+lm_pred <- predict(lm_fit, df_test) %>%
+  bind_cols(df_test %>% dplyr::select(init_ult_diff))
+
+lm_metric <- model_metrics(lm_pred, 
+                           truth = init_ult_diff, 
+                           estimate = .pred) %>%
+  mutate(model = "lm") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+
+### 2.1.5 XGBoost
+
+
+```{r}
+# the model tuning for xgboost takes about 5 hours
+# to shorten the run time to generate the HTML file, I have indicated the parameters that would give the best model performance based on my previous full run
+# to perform the model tuning, 
+
+xgboost_recipe <- gen_recipe %>%
+  step_dummy(all_nominal())
+
+xgboost_spec <- 
+#  boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), 
+#    loss_reduction = tune(), sample_size = tune()) %>% # remove '#' for the parameters to be tuned
+  boost_tree(trees = 1688, min_n = 38, tree_depth = 11, learn_rate = 0.0778, loss_reduction = 0.00000997, 
+             sample_size = 0.463) %>% # include '#' in front of the code to skip this code if we want to tune the parameters
+  set_mode("regression") %>% 
+  set_engine("xgboost") 
+
+xgboost_workflow <- 
+  workflow() %>% 
+  add_recipe(xgboost_recipe) %>% 
+  add_model(xgboost_spec) 
+
+set.seed(12071)
+# remove the '#' if we want to tune the parameters
+#xgboost_tune <-
+#  tune_grid(xgboost_workflow, 
+#            resamples = df_folds, 
+#            grid = num_grid)
+
+xgboost_fit <- xgboost_workflow %>%
+# remove the '#' if we want to use the current tuned parameters to fit the model
+#  finalize_workflow(select_best(xgboost_tune, "rmse")) %>%
+  last_fit(df_split)
+
+xgboost_pred <- xgboost_fit %>%
+  collect_predictions()
+
+xgboost_metric <- model_metrics(xgboost_pred, 
+                               truth = init_ult_diff, 
+                               estimate = .pred) %>%
+  mutate(model = "xgboost") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+
+
+### 2.1.6 K Nearest Neighbours
+
+```{r}
+
+kknn_spec <- 
+  nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("kknn") 
+
+kknn_workflow <- 
+  workflow() %>% 
+  add_recipe(gen_recipe) %>%
+  add_model(kknn_spec) 
+
+set.seed(96032)
+kknn_tune <-
+  tune_grid(kknn_workflow, resamples = df_folds, grid = num_grid)
+
+kknn_fit <- kknn_workflow %>%
+  finalize_workflow(select_best(kknn_tune, "rmse")) %>%
+  last_fit(df_split)
+
+kknn_pred <- kknn_fit %>%
+  collect_predictions()
+
+kknn_metric <- model_metrics(kknn_pred, 
+                               truth = init_ult_diff, 
+                               estimate = .pred) %>%
+  mutate(model = "kknn") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+
+
+## 2.2 With claim descriptions
+
+To facilitate the model comparison, I will be building a random forest machine learning model with directly modeling on the claim descriptions, instead of performing text mining during EDA stage.
+
+Note that we have decided the engine the model specs in the random forest section above. Hence instead of redefine again, I will be using the same specs again. This illustrates the beauty of **tidymodels** interface, allowing the users to reuse some of the machine learning "parts".
+
+```{r}
+ranger_recipe_clmdesc <- 
+  recipe(formula = init_ult_diff ~ ., data = df_wClmDesc_train) %>%
+  update_role(c(DateTimeOfAccident, DateReported), new_role = "id") %>%
+  step_tokenize(ClaimDescription) %>%
+  step_stopwords(ClaimDescription) %>% 
+  step_tokenfilter(ClaimDescription, max_tokens = 20) %>%
+  step_tfidf(ClaimDescription)
+
+ranger_workflow_clmdesc <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe_clmdesc) %>% 
+  add_model(ranger_spec) 
+
+set.seed(51107)
+ranger_tune_clmdesc <-
+  tune_grid(ranger_workflow_clmdesc, 
+            resamples = df_wClmDesc_folds, 
+            grid = num_grid)
+
+ranger_final_wf_clmdesc <- ranger_workflow_clmdesc %>%
+  finalize_workflow(select_best(ranger_tune_clmdesc)) 
+
+ranger_fit_clmdesc <- ranger_final_wf_clmdesc %>%
+  last_fit(df_wClmDesc_split)
+
+ranger_clmdesc_pred <- ranger_fit_clmdesc %>%
+  collect_predictions()
+
+ranger_clmdesc_metric <- model_metrics(ranger_clmdesc_pred, 
+                               truth = init_ult_diff, 
+                               estimate = .pred) %>%
+  mutate(model = "ranger_clmdesc") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+
+## 2.3 Model direct on the ultimate claim amount
+
+Similarly, to compare the difference in accuracy between the model fitted on the difference in initial and ultimate claim amount & the model directly fitted on ultimate claim amount, I will fit a random forest model for comparison.
+
+
+```{r}
+ranger_recipe_ult <- 
+  recipe(formula = UltimateIncurredClaimCost ~ ., data = df_ult_train) %>%
+  step_date(c(DateTimeOfAccident, DateReported)) %>%
+  step_mutate(DateTimeOfAccident_hr = lubridate::hour(DateTimeOfAccident),
+              DateTimeOfAccident_hr = factor(DateTimeOfAccident_hr, order = TRUE)) %>%
+  update_role(c(DateTimeOfAccident, DateReported, InitialIncurredClaimCost), new_role = "id") %>%
+  prep()
+
+ranger_workflow_ult <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe_ult) %>% 
+  add_model(ranger_spec) 
+
+set.seed(51107)
+ranger_tune_ult <-
+  tune_grid(ranger_workflow_ult, 
+            resamples = df_ult_folds, 
+            grid = num_grid)
+
+ranger_fit_ult <- ranger_workflow_ult %>%
+  finalize_workflow(select_best(ranger_tune_ult)) %>%
+  last_fit(df_ult_split)
+
+ranger_ult_pred <- ranger_fit_ult %>%
+  collect_predictions() %>%
+  bind_cols(df_ult_test$InitialIncurredClaimCost) %>%
+  rename("InitialIncurredClaimCost" = "...6") %>%
+  mutate(pred_diff = .pred - InitialIncurredClaimCost,
+         act_diff = UltimateIncurredClaimCost - InitialIncurredClaimCost)
+
+ranger_ult_metric <- model_metrics(ranger_ult_pred, 
+                               truth = act_diff, 
+                               estimate = pred_diff) %>%
+  mutate(model = "ranger_ult") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+## 2.4 Sub models
+
+Sub Model - Less 20 weeks paid initial estimated
+```{r}
+ranger_recipe_less20wk <- 
+  recipe(formula = init_ult_diff ~ ., data = df_less20wk_train) 
+
+ranger_workflow_less20wk <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe_less20wk) %>% 
+  add_model(ranger_spec) 
+
+set.seed(51107)
+ranger_tune_less20wk <-
+  tune_grid(ranger_workflow_less20wk, 
+            resamples = df_less20wk_folds, 
+            grid = num_grid)
+
+ranger_fit_less20wk <- ranger_workflow_less20wk %>%
+  finalize_workflow(select_best(ranger_tune_less20wk)) %>%
+  last_fit(df_less20wk_split)
+
+```
+
+
+Sub Model - More 20 weeks paid initial estimated
+```{r}
+ranger_recipe_more20wk <- 
+  recipe(formula = init_ult_diff ~ ., data = df_more20wk_train)
+
+ranger_workflow_more20wk <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe_more20wk) %>% 
+  add_model(ranger_spec) 
+
+set.seed(51107)
+ranger_tune_more20wk <-
+  tune_grid(ranger_workflow_more20wk, 
+            resamples = df_more20wk_folds, 
+            grid = num_grid)
+
+ranger_fit_more20wk <- ranger_workflow_more20wk %>%
+  finalize_workflow(select_best(ranger_tune_more20wk)) %>%
+  last_fit(df_more20wk_split)
+
+```
+
+Combine the predictions
+```{r}
+ranger_20wk_pred <- bind_rows(ranger_fit_less20wk %>% collect_predictions(),
+                         ranger_fit_more20wk %>% collect_predictions())
+
+ranger_20wk_metric <- model_metrics(ranger_20wk_pred, 
+                                    truth = init_ult_diff, 
+                                    estimate = .pred)  %>%
+  mutate(model = "ranger_20wk") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+
+## 2.5 Variable Selection
+
+In this sub-section, variation selection algorithm is first used to select the variables that are useful in explaining the results.
+
+Then I fit a random forest model by using the subset of the variables.
+
+
+I have selected top 10 variables based on their variable importance.
+
+```{r}
+ranger_workflow_vip <- 
+  ranger_workflow %>%
+  update_formula(init_ult_diff ~  num_week_paid_init +
+                                           WeeklyWages +
+                                           injury_body +
+                                           Age +
+                                           DateReported_year +
+                                           DateTimeOfAccident_year +
+                                           day_diff +
+                                           injury_cause +
+                                           injury_type +
+                                           HoursWorkedPerWeek)
+
+```
+
+
+Note that I have reused the workflow object created for random forest and perform an update on the formula.
+
+
+Somehow the algorithm doesn't work when I specify I would like to fit a model with a pre-processed variable. So, to overcome this, I apply the bake function on the original dataset and re-split the data point.
+
+```{r}
+df_vip <- bake(gen_recipe, new_data = df)
+
+# Dataset with pre-text mining during EDA stage
+df_vip_split <- initial_split(df_vip,
+                            prop = prop_train_test,
+                            strata = init_ult_diff)
+
+df_vip_train <- training(df_vip_split)
+df_vip_test <- testing(df_vip_split)
+
+df_vip_folds <- vfold_cv(df_vip_train, strata = init_ult_diff)
+df_vip_folds 
+
+```
+
+
+Once the dataset is prepared, I will start performing tuning to build the machine learning models.
+
+```{r}
+set.seed(51107)
+ranger_tune_vip <-
+  tune_grid(ranger_workflow_vip, 
+            resamples = df_vip_folds, 
+            grid = num_grid)
+
+ranger_fit_vip <- ranger_workflow_vip %>%
+  finalize_workflow(select_best(ranger_tune_vip)) %>%
+  last_fit(df_vip_split)
+
+ranger_vip_pred <- ranger_fit_vip %>%
+  collect_predictions()
+
+ranger_vip_metric <- model_metrics(ranger_vip_pred, 
+                               truth = init_ult_diff, 
+                               estimate = .pred) %>%
+  mutate(model = "ranger_vip") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+## 2.6 Without data pre-processing & EDA
+
+For comparison purpose, I have also fitted the model without performing any forms of EDA to compare the model performance.
+
+
+```{r}
+ranger_recipe_org <- 
+  recipe(formula = UltimateIncurredClaimCost ~ ., data = df_org_train) %>%
+  update_role(c(DateTimeOfAccident, DateReported, ClaimDescription), new_role = "id") %>% # update the roles of original date variables to "id"
+  prep()
+
+ranger_workflow_org <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe_org) %>% 
+  add_model(ranger_spec) 
+
+set.seed(51107)
+ranger_tune_org <-
+  tune_grid(ranger_workflow_org, 
+            resamples = df_org_folds, 
+            grid = num_grid)
+
+ranger_fit_org <- ranger_workflow_org %>%
+  finalize_workflow(select_best(ranger_tune_org)) %>%
+  last_fit(df_org_split)
+
+ranger_org_pred <- ranger_fit_org %>%
+  collect_predictions() %>%
+  bind_cols(df_org_test$InitialIncurredCalimsCost) %>%
+  rename("InitialIncurredClaimCost" = "...6") %>%
+  mutate(pred_diff = .pred - InitialIncurredClaimCost,
+         act_diff = UltimateIncurredClaimCost - InitialIncurredClaimCost)
+
+ranger_org_metric <- model_metrics(ranger_org_pred, 
+                               truth = act_diff, 
+                               estimate = pred_diff) %>%
+  mutate(model = "ranger_org") %>%
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+
+```
+
+
+# 3 Model Performance
+
+## 3.1 Comparison on Metrics
+
+### 3.1.1 Comparison on the different models
+```{r, include = FALSE}
+# all results
+model_metric_result <- tibble() %>%
+  bind_rows(lm_metric)
+
+for (i in model_list){
+  model_metric_result <- model_metric_result %>%
+    bind_rows(get(paste0(i, "_metric"))) 
+    
+}
+
+model_metric_result %>%
+  bind_rows(ranger_clmdesc_metric) %>%
+  bind_rows(ranger_org_metric) %>%
+  bind_rows(ranger_ult_metric) %>%
+  bind_rows(ranger_20wk_metric) %>%
+  bind_rows(ranger_vip_metric)
+
+```
+
+
+```{r}
+tibble() %>%
+  bind_rows(ranger_metric) %>%
+  bind_rows(xgboost_metric) %>%
+  bind_rows(glmnet_metric) %>%
+  bind_rows(lm_metric) %>%
+  bind_rows(earth_metric) %>%
+  bind_rows(kknn_metric)
+
+```
+
+
+Below are the observations:
+
+
+- In general, the results from the various metrics are consistent with one another.
+
+
+- Out of all the models, ranger model has the highest accuracy.
+
+
+
+### 3.1.2 Comparison on model *with* data cleaning & *without* data cleaning
+```{r}
+tibble() %>%
+  bind_rows(ranger_org_metric) %>%
+  bind_rows(ranger_ult_metric)
+
+```
+
+
+The model performance improved significantly after we perform data cleaning. THis is because there are unreasonable values and outliers within the dataset. Below is one of the example of unreasonable values:
+
+```{r}
+df_org %>%
+  dplyr::select(HoursWorkedPerWeek) %>%
+  skim()
+
+```
+
+
+Note that the max hours is 640 hours, but the max hours within a week is 168 hours (ie. 24 hours over 7 days).
+
+
+### 3.1.3 Comparison on directly model on actual claim cost and claim difference between initial and actual
+
+```{r}
+tibble() %>%
+  bind_rows(ranger_ult_metric) %>%
+  bind_rows(ranger_metric)
+
+```
+
+
+There is slight improvements when I choose to model the claim difference, instead of directly model on the claim difference.
+
+
+Above does not imply we should always model on the claim difference. This is where we could apply our domain knowledge to see which way of analyzing the problems could provide us the highest accuracy.
+
+
+### 3.1.4 Comparison on full model and simpler model
+
+```{r}
+tibble() %>%
+  bind_rows(ranger_metric) %>%
+  bind_rows(ranger_vip_metric)
+
+```
+
+
+Note that the model performance for the simpler model is also same as the full model. This indicates that the simpler model requires less inputs to have similar level of accuracy.
+
+
+### 3.1.5 Comparison on different text mining method
+
+```{r}
+tibble() %>%
+  bind_rows(ranger_metric) %>%
+  bind_rows(ranger_clmdesc_metric)
+
+```
+
+
+The metric result under **textrecipe** method is better than the one model by using **tidytext** method. This is probably due to the tf-idf function used under **textrecipe** method.
+
+
+## 3.2 Variable importance Comparison Across Models
+
+In this section, I will extract the variable importance from various machine learning models and print them out for comparison.
+
+### 3.2.1 Without Claim Descriptions
+
+```{r}
+lm_fit %>% 
+  vi() %>%
+  slice_max(abs(Importance), n = vip_var_num) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance)) %>%
+  ggplot(aes(Importance, Variable)) +
+  geom_col(show.legend =  FALSE) +
+  labs(y = NULL, title = "Linear Regression")
+
+```
+
+
+```{r}
+for (i in vip_model_list){
+
+  assign(paste0(i, "_vip"), pull_workflow_fit(get(paste0(i, "_fit"))$.workflow[[1]]) %>% vi())
+
+  assign(paste0(i, "_vip_graph"), get(paste0(i, "_vip")) %>%
+  slice_max(abs(Importance), n = vip_var_num) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+  ) %>%
+  ggplot(aes(Importance, Variable)) +
+  geom_col(show.legend = FALSE) +
+  labs(y = NULL, title = sym(i)))
+  
+}
+
+```
+
+Note that knn model doesn't have vip. Hence it is not included in the list above.
+
+
+### 3.2.2 With Claim Descriptions
+
+```{r}
+ranger_vip_clmdesc <- pull_workflow_fit(ranger_fit_clmdesc$.workflow[[1]]) %>%
+  vi()
+
+ranger_vip_graph_clmdesc <- ranger_vip_clmdesc %>%
+  slice_max(abs(Importance), n = vip_var_num) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+  ) %>%
+  ggplot(aes(Importance, Variable)) +
+  geom_col(show.legend = FALSE) +
+  labs(y = NULL, title = "ranger - Model directly on claim descriptions")
+
+```
+
+### 3.2.3 Model directly on ultimate claim cost
+
+```{r}
+ranger_vip_ult <- pull_workflow_fit(ranger_fit_ult$.workflow[[1]]) %>%
+  vi()
+
+ranger_vip_graph_ult <- ranger_vip_ult %>%
+  slice_max(abs(Importance), n = vip_var_num) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+  ) %>%
+  ggplot(aes(Importance, Variable)) +
+  geom_col(show.legend = FALSE) +
+  labs(y = NULL, title = "ranger - Model directly on ultimate claim amount")
+
+```
+
+
+### 3.2.4 Sub-models
+
+```{r}
+# 20 weeks and below
+ranger_vip_less20wk <- pull_workflow_fit(ranger_fit_less20wk$.workflow[[1]]) %>%
+  vi()
+
+ranger_vip_graph_less20wk <- ranger_vip_less20wk %>%
+  slice_max(abs(Importance), n = vip_var_num) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+  ) %>%
+  ggplot(aes(Importance, Variable)) +
+  geom_col(show.legend = FALSE) +
+  labs(y = NULL, title = "ranger - submodel with less than 20 weeks initial estimated paid week")
+
+# 20 weeks and above
+ranger_vip_more20wk <- pull_workflow_fit(ranger_fit_more20wk$.workflow[[1]]) %>%
+  vi()
+
+ranger_vip_graph_more20wk <- ranger_vip_more20wk %>%
+  slice_max(abs(Importance), n = vip_var_num) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+  ) %>%
+  ggplot(aes(Importance, Variable)) +
+  geom_col(show.legend = FALSE) +
+  labs(y = NULL, title = "ranger - submodel with more than 20 weeks initial estimated paid week")
+
+```
+
+
+### 3.2.5 With variable selection
+
+```{r}
+# Variable selection through variable importance
+ranger_vip_vip <- pull_workflow_fit(ranger_fit_vip$.workflow[[1]]) %>%
+  vi()
+
+ranger_vip_graph_vip <- ranger_vip_vip %>%
+  slice_max(abs(Importance), n = vip_var_num) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+  ) %>%
+  ggplot(aes(Importance, Variable)) +
+  geom_col(show.legend = FALSE) +
+  labs(y = NULL, title = "Random Forest - Var Select - vip")
+
+```
+
+
+### 3.2.6 Model directly on ultimate claim cost - original dataset
+
+```{r}
+ranger_vip_org <- pull_workflow_fit(ranger_fit_org$.workflow[[1]]) %>%
+  vi()
+
+ranger_vip_graph_org <- ranger_vip_org %>%
+  slice_max(abs(Importance), n = vip_var_num) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+  ) %>%
+  ggplot(aes(Importance, Variable)) +
+  geom_col(show.legend = FALSE) +
+  labs(y = NULL, title = "ranger - Model directly on ultimate claim amount")
+
+```
+
+
+
+### 3.2.4 Comparison on Variable Importance
+
+Finally, the variable importance graphs for different machine learning models are printed out for comparison.
+
+```{r fig_height = 60}
+for (i in vip_model_list){
+  print(get(paste0(i, "_vip_graph")))
+}
+
+ranger_vip_graph_clmdesc
+ranger_vip_graph_ult
+ranger_vip_graph_org
+ranger_vip_graph_less20wk
+ranger_vip_graph_more20wk
+ranger_vip_graph_vip
+
+```
+
+
+Most of the machine learning models agree that *num_week_paid_init* is the most important variable in explaining the results.
+
+
+## 3.3 Plot on Predictions vs Actual
+
+Define the attributes for the graphs
+```{r}
+graph_alpha <- 0.3
+graph_color <- "blue"
+graph_line_slope <- 1
+graph_line_intercept <- 0
+
+```
+
+
+Next, I will plot the graphs.
+
+
+### 3.3.1 Without Claim Descriptions
+
+```{r}
+lm_predVsActual <- lm_pred %>% 
+  ggplot(aes(init_ult_diff, .pred)) + 
+  geom_point(alpha = graph_alpha, color = graph_color) +
+  geom_abline(slope = graph_line_slope, intercept = graph_line_intercept) +
+  xlab("Actual Diff") +
+  ylab("Predicted Diff") +
+  labs(title = "Linear Model")
+
+```
+
+
+
+```{r}
+for (i in model_list){
+  assign(paste0(i, "_predVsActual"), 
+         collect_predictions(get(paste0(i, "_fit"))) %>% 
+          ggplot(aes(init_ult_diff, .pred)) + 
+          geom_point(alpha = graph_alpha, color = graph_color) +
+          geom_abline(slope = graph_line_slope, intercept = graph_line_intercept) +
+          xlab("Actual Diff") +
+          ylab("Predicted Diff") +
+          labs(title = sym(i)))
+  
+  print(get(paste0(i, "_predVsActual")))
+}
+
+```
+
+
+### 3.3.2 With Claim Descriptions
+
+```{r}
+ranger_predVsActual_clmdesc <- collect_predictions(ranger_fit_clmdesc) %>% 
+  ggplot(aes(init_ult_diff, .pred)) + 
+  geom_point(alpha = graph_alpha, color = graph_color) +
+  geom_abline(slope = graph_line_slope, intercept = graph_line_intercept) +
+  xlab("Actual Diff") +
+  ylab("Predicted Diff") +
+  labs(title = "ranger - Modelled on Claim Descriptions directly")
+
+```
+
+
+### 3.3.3 Model directly on ultimate claim cost
+
+```{r}
+ranger_predVsActual_ult <- ranger_ult_pred %>% 
+  ggplot(aes(act_diff, pred_diff)) + 
+  geom_point(alpha = graph_alpha, color = graph_color) +
+  geom_abline(slope = graph_line_slope, intercept = graph_line_intercept) +
+  xlab("Actual Diff") +
+  ylab("Predicted Diff") +
+  labs(title = "ranger - Modelled on Claim Descriptions directly")
+
+```
+
+
+
+### 3.3.4 Sub models
+
+```{r}
+ranger_predVsActual_20wk <- ranger_20wk_pred %>% 
+  ggplot(aes(init_ult_diff, .pred)) + 
+  geom_point(alpha = graph_alpha, color = graph_color) +
+  geom_abline(slope = graph_line_slope, intercept = graph_line_intercept) +
+  xlab("Actual Diff") +
+  ylab("Predicted Diff") +
+  labs(title = "ranger - Var Select - sub model")
+
+```
+
+
+### 3.3.5 Variable selections
+
+```{r}
+ranger_predVsActual_vip <- collect_predictions(ranger_fit_vip) %>% 
+  ggplot(aes(init_ult_diff, .pred)) + 
+  geom_point(alpha = graph_alpha, color = graph_color) +
+  geom_abline(slope = graph_line_slope, intercept = graph_line_intercept) +
+  xlab("Actual Diff") +
+  ylab("Predicted Diff") +
+  labs(title = "ranger - Var Select - vip")
+
+```
+
+
+### 3.3.6 Model directly on ultimate claim cost - original dataset
+
+```{r}
+ranger_predVsActual_org <- ranger_org_pred %>% 
+  ggplot(aes(act_diff, pred_diff)) + 
+  geom_point(alpha = graph_alpha, color = graph_color) +
+  geom_abline(slope = graph_line_slope, intercept = graph_line_intercept) +
+  xlab("Actual Diff") +
+  ylab("Predicted Diff") +
+  labs(title = "ranger - Modelled on Original Dataset")
+
+```
+
+
+Plot out all the graphs
+```{r}
+ranger_predVsActual_clmdesc
+ranger_predVsActual_ult
+ranger_predVsActual_org
+ranger_predVsActual_20wk
+ranger_predVsActual_vip
+
+```
+
+
+If the model is predicting accurately, all the points will be on the black line. If the points are above the lines, it means the data points are overpredicted. If the points are below the line, it means the predicted value is lower than the actual value.
+
+
+
+## 3.4 Partial Regression Plot
+
+### 3.4.1 Without Claim Descriptions
+
+[This](https://community.rstudio.com/t/how-to-use-pdp-partial-in-tidymodels/69735/2) is similar to the [prediction profiler options](https://www.jmp.com/support/help/en/15.2/index.shtml#page/jmp/prediction-profiler-options.shtml) in JMP Pro.
+
+
+To plot out the partial regression plot 
+```{r}
+ranger_fit_pdp <- fit(ranger_final_wf, df_train)
+
+```
+
+Create two variable lists to separate numeric and categorical variables
+```{r}
+# Numeric variables
+num_var_list <- df_train %>% 
+  select_if(is.numeric) %>% 
+  dplyr::select(-init_ult_diff) %>% 
+  names()
+
+# Categorical variables
+cat_var_list <- df_train %>% 
+  select_if(negate(is.numeric)) %>%
+  dplyr::select(-c(DateTimeOfAccident, DateReported)) %>%
+  names() %>%
+  append(c("DateTimeOfAccident_year",
+           "DateTimeOfAccident_month", 
+           "DateTimeOfAccident_dow", 
+           "DateTimeOfAccident_hr"))
+
+```
+
+#### 3.4.1.1 Numeric variables
+Plotting out the numeric variables
+```{r}
+for (i in num_var_list){
+  ranger_pdp <- 
+  recipe(init_ult_diff ~ ., data = df_train) %>%
+  step_date(c(DateTimeOfAccident, DateReported)) %>%
+  step_mutate(DateTimeOfAccident_hr = lubridate::hour(DateTimeOfAccident),
+              DateTimeOfAccident_hr = factor(DateTimeOfAccident_hr, order = TRUE)) %>%
+  step_profile(all_predictors(), -sym(i), profile = vars(i)) %>%
+  prep() %>%
+  juice()
+
+  print(predict(ranger_fit_pdp, ranger_pdp) %>%
+  bind_cols(ranger_pdp) %>%
+  ggplot(aes(x = get(i), y = .pred)) +
+    xlab(sym(i)) +
+    labs(title = paste0("Partial Regression Plot on ", sym(i))) +
+  geom_path()
+  )
+}
+
+```
+
+#### 3.4.1.2 Categorical variables
+Plotting out for all the categorical variables
+```{r}
+for (i in cat_var_list){
+  ranger_pdp <- 
+  recipe(init_ult_diff ~ ., data = df_train) %>%
+  step_date(c(DateTimeOfAccident, DateReported)) %>%
+  step_mutate(DateTimeOfAccident_hr = lubridate::hour(DateTimeOfAccident),
+              DateTimeOfAccident_hr = factor(DateTimeOfAccident_hr, order = TRUE),
+              DateTimeOfAccident_year = factor(DateTimeOfAccident_year, order = TRUE),
+              DateReported_year = factor(DateReported_year, order = TRUE)) %>%
+  step_profile(all_predictors(), -sym(i), profile = vars(i)) %>%
+  prep() %>%
+  juice()
+
+  print(predict(ranger_fit_pdp, ranger_pdp) %>%
+  bind_cols(ranger_pdp) %>%
+  ggplot(aes(x = get(i), y = .pred)) +
+    xlab(sym(i)) +
+    labs(title = paste0("Partial Regression Plot on ", sym(i))) +
+    theme(axis.text.x = element_text(angle = 90)) +
+  geom_col()
+  )
+}
+
+```
+
+
+From the graph for num_week_paid_init, it seems like the predicted values are understated when the num_week_paid_init is shorter, overstated when the num_week_paid_init is long.
+
+
+There seems to be some structural pattern within the graph. There is a sharp drop in 20 weeks. This is where I fit two sub models (one with weeks less than 20 & another one with weeks more than 20) to see whether this would improve the model accuracy.
+
+
+
+## 3.5 Partial Dependence Plot
+
+
+The issue with partial regression plot is that it only considers one combinations of variables while deriving the marginal effect. So, over here, I will use partial dependence plot.
+
+
+Partial dependence plot measures the average marginal effect of the selected variable.
+
+
+```{r}
+pdp_pred_fun <- function(object, newdata) {
+  predict(object, newdata, type = "numeric")$.pred
+}
+
+pdp_pred_fun_cat <- function(object, newdata) {
+  predict(object, newdata)$.pred
+}
+
+ranger_pred <- pdp_pred_fun(ranger_fit_pdp, df_train)
+
+ranger_pred_cat <- pdp_pred_fun_cat(ranger_fit_pdp, df_train)
+
+```
+
+
+```{r}
+for (i in num_var_list){
+  assign(paste0("workflow_partial_" ,i),
+  partial(ranger_fit_pdp,
+          pred.var = i,
+          ice = TRUE,
+          center = TRUE,
+          plot.engine = "ggplot2",
+          pred.fun = pdp_pred_fun,
+          train = df_train %>% dplyr::select(-init_ult_diff)))
+  
+  assign(paste0("graph_partial_", i),
+         plotPartial(get(paste0("workflow_partial_" ,i))))
+  
+  print(get(paste0("graph_partial_", i)))
+    
+}
+
+
+```
+
+
+Note that the most of the partial dependence plots look different from those under partial regression plot. This is because the partial dependence plot permutates over different combinations and measure the marginal effect of the selected variable.
+
+
+# Appendix
+
+```{r save the results}
+#save.image(file = "data/MITBCapstone_machinelearn_actLoss_Jasper_v3.RData")
+load(file = "data/MITBCapstone_machinelearn_actLoss_Jasper_v3.RData")
+
+```
+
+

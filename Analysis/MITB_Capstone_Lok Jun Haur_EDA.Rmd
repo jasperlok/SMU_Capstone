@@ -1,0 +1,636 @@
+---
+title: "MITB Capstone Project"
+subtitle: "When 1 + 1 > 2: How Modern Data Science Could Complement Actuarial Science in Claim Cost Estimation - Explanatory Data Analysis"
+author: "Jasper Lok (Supervisor: Professor Kam Tin Seong)"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    toc_collapsed: true
+    highlight: tango
+---
+
+# 1.0   Getting Started
+
+Note that to make it easier to manage the results for this capstone project, the different tasks (ie. exploratory data analysis and supervised learning) in capstone project will be split into different HTML result files. 
+
+This HTML file will focus on Exploratory Data Analysis.
+
+## 1.1    Setup R Environment for Later Analysis
+
+Call the relevant packages to setup the environment.
+```{r setup environment, warning = FALSE, message = FALSE}
+packages <- c('tidyverse', 'lubridate', 'funModeling', 'corrplot', 'tibble', 'skimr', 'plotly', 'reshape2', 'tidytext', 'tm', 'ggstatsplot', 'ggmosaic','readxl', 'gridExtra', 'stopwords', 'ggwordcloud', 'stringr', 'infer', 'tictoc', 'beepr', 'PMCMRplus')
+
+for (p in packages){
+  if(!require (p, character.only = T)){
+    install.packages(p)
+  }
+  library(p, character.only = T)
+}
+
+```
+
+Set the random seed for reproducibility
+```{r set the random seed for the analysis}
+set.seed(123)
+
+```
+
+
+# 2.0   Exploratory Data Analysis (EDA)
+
+In this section, I will perform various EDA to ensure the dataset is good enough for us to build machine learning models in a later steps.
+
+## 2.1    Import Data
+
+```{r load additional info}
+data <- read_csv("data/actuarial_loss_train.csv") %>%
+  rename(InitialIncurredClaimCost = InitialIncurredCalimsCost)
+
+```
+
+```{r}
+data_addCol <- data %>%
+  mutate(day_diff = difftime(DateReported, as.Date(DateTimeOfAccident), units = "days"),
+         day_diff = as.numeric(day_diff),
+         init_ult_diff = UltimateIncurredClaimCost - InitialIncurredClaimCost,
+         acc_yr = factor(year(DateTimeOfAccident), order = TRUE),
+         acc_qtr = factor(quarter(DateTimeOfAccident), order = TRUE), 
+         acc_mth = factor(month(DateTimeOfAccident), order = TRUE),
+         report_yr = factor(year(DateReported), order = TRUE),
+         report_qtr = factor(quarter(DateReported), order = TRUE),
+         report_mth = factor(month(DateReported), order = TRUE),
+         acc_hr = factor(hour(DateTimeOfAccident), order = TRUE),
+         num_week_paid_init = InitialIncurredClaimCost/WeeklyWages,
+         num_week_paid_ult = UltimateIncurredClaimCost/WeeklyWages)
+
+```
+
+
+## 2.1    Data Quality Check
+
+This is the base R function to check the data quality. The output from this function is often not sufficient.
+```{r use summary to check data}
+summary(data_addCol)
+
+```
+
+Three approaches (ie. **status**, **profiling_num** & **skim**) are used to check the quality of the data. This is because all approaches contain different measurements in the result file, i.e. complement each other.
+
+```{r check data quality}
+status(data_addCol)
+
+```
+
+
+```{r further data quality check}
+profiling_num(data_addCol)
+
+```
+
+```{r generate data quality report}
+skim(data_addCol)
+
+```
+
+Note that this data set only contains policies that claim from the company.
+
+
+
+## 2.3    Outlier Checking
+
+Over here, I have used Tukey outlier method to find the threshold for the values to be considered as outliers.
+
+```{r}
+# Tukey's method
+tukey_outlier(data_addCol$UltimateIncurredClaimCost)
+tukey_outlier(data_addCol$init_ult_diff)
+tukey_outlier(data_addCol$num_week_paid_init)
+tukey_outlier(data_addCol$num_week_paid_ult)
+
+```
+
+After finding the thresholds for the outliers, remove the outliers from the data. Note that I am not using the prep_outlier function here as the function capped the outlier values at the max threshold, which doesn't look correct.
+
+```{r}
+data_1 <- data_addCol %>%
+  # remove the hours per week have more than 168 hours
+  filter(HoursWorkedPerWeek < 168) %>%
+  # remove the outliers from the dataset
+  filter(init_ult_diff > -6500,
+         init_ult_diff < 7300,
+         num_week_paid_init < 80,
+         num_week_paid_ult < 85)
+
+```
+
+
+Re-check the dataset after remove the outliers from the dataset
+
+```{r}
+skim(data_1)
+
+```
+
+
+
+## 2.4    Feature Engineering
+
+Text Mining
+
+```{r}
+tidy_clm_unigram <- data_1 %>%
+  unnest_tokens(word, ClaimDescription, token = "ngrams", n = 1) %>%
+  anti_join(get_stopwords())
+
+cleaned_clm_unigram <- tidy_clm_unigram %>%
+  count(word, sort = TRUE) %>%
+  mutate(cum_count = cumsum(n),
+         cum_perc = cum_count/sum(n))
+
+```
+
+```{r}
+cleaned_clm_unigram %>%
+  filter(n > 300) %>%
+  ggplot(aes(label = word, size = n, color = n)) +
+  geom_text_wordcloud() +
+  scale_size_area(max_size = 20) +
+  theme_minimal()
+
+
+```
+
+
+Create indicator for various injury types
+
+```{r}
+body_part_list <- c("back", "finger", "hand", "shoulder", "eye", "knee", "wrist", "thumb", "neck", "ankle", "arm", "foot", "leg", "forearm", "elbow", "head")
+
+tidy_clm_unigram_1 <- tidy_clm_unigram
+
+for (i in body_part_list){
+  new_col <- paste0("body_", i)
+  
+  tidy_clm_unigram_1 <- tidy_clm_unigram_1 %>%
+    mutate(!!sym(new_col) := case_when(word == i ~ 1,
+                                       TRUE ~ 0))
+}
+
+
+side_list <- c("left", "right", "upper")
+
+for (i in side_list){
+  new_col <- paste0("side_", i)
+  
+  tidy_clm_unigram_1 <- tidy_clm_unigram_1 %>%
+    mutate(!!sym(new_col) := case_when(word == i ~ 1,
+                                       TRUE ~ 0))
+}
+
+
+item_list <- c("knife", "metal", "ladder", "door", "floor", "stairs", "machine", "box", "vehicle")
+
+for (i in item_list){
+  new_col <- paste0("item_", i)
+  
+  tidy_clm_unigram_1 <- tidy_clm_unigram_1 %>%
+    mutate(!!sym(new_col) := case_when(word == i ~ 1,
+                                       TRUE ~ 0))
+}
+
+tidy_clm_unigram_1 <- tidy_clm_unigram_1 %>%
+  mutate(item_vehicle = case_when(word == c("vehicle", "motor", "truck", "car") ~ 1,
+                                  TRUE ~ 0))
+
+
+
+injury_cause_list <- c("lifting", "struck", "accident", "slip", "grind", "trip", "fall", "hit", "repetitive")
+
+for (i in injury_cause_list){
+  new_col <- paste0("injury_cause_", i)
+  
+  tidy_clm_unigram_1 <- tidy_clm_unigram_1 %>%
+    mutate(!!sym(new_col) := case_when(word == i ~ 1,
+                                       TRUE ~ 0))
+}
+
+
+tidy_clm_unigram_1 <- tidy_clm_unigram_1 %>%
+  mutate(injury_cause_slip = case_when(word == c("slipped", "slip", "slipping") ~ 1,
+                                       TRUE ~ 0),
+         injury_cause_grind = case_when(word == c("grinding", "grinder") ~ 1,
+                                       TRUE ~ 0),
+         injury_cause_trip = case_when(word == c("tripped", "trip") ~ 1,
+                                      TRUE ~ 0),
+         injury_cause_fall = case_when(word == c("fell", "fall", "falling", "fallen") ~ 1,
+                                      TRUE ~ 0),
+         injury_cause_hit = case_when(word == c("hitting", "hit") ~ 1,
+                                     TRUE ~ 0))
+
+
+tidy_clm_unigram_1 <- tidy_clm_unigram_1 %>%
+  mutate(injury_type_strain = case_when(word == c("strain", "strained") ~ 1,
+                                        TRUE ~ 0),
+         injury_type_sprain = case_when(word == c("sprain", "sprained") ~ 1,
+                                        TRUE ~ 0),
+         injury_type_bruise = case_when(word == c("bruised", "bruising", "bruise", "bruises") ~ 1,
+                                        TRUE ~ 0),
+         injury_type_twist = case_when(word == c("twisted", "twisting", "twist") ~ 1,
+                                       TRUE ~ 0),
+         injury_type_cut = case_when(word == c("cut", "cutting", "cutter", "cuts") ~ 1,
+                                     TRUE ~ 0),
+         injury_type_fracture = case_when(word == c("fracture", "fractured") ~ 1,
+                                          TRUE ~ 0),
+         injury_type_burn = case_when(word == c("burn", "burned", "burns") ~ 1,
+                                      TRUE ~ 0))
+
+
+```
+
+
+Check whether there is any repeated claim number
+```{r}
+check_clm <- data_1 %>%
+  group_by(ClaimNumber) %>%
+  summarise(count = n())
+
+```
+
+
+```{r}
+data_2 <- data_1
+
+# Join back body part injury
+for (i in body_part_list){
+  new_col <- paste0("body_", i)
+  
+  temp <- tidy_clm_unigram_1 %>%
+    group_by(ClaimNumber) %>%
+    summarise(!!sym(new_col) := case_when(sum(get(paste0("body_", i))) > 0 ~ 1,
+                                       TRUE ~ 0))
+  data_2 <- data_2 %>%
+    left_join(temp, by = c("ClaimNumber"))
+  
+  rm(temp)
+}
+
+
+# Join back body side part injury
+for (i in side_list){
+  new_col <- paste0("side_", i)
+  
+  temp <- tidy_clm_unigram_1 %>%
+    group_by(ClaimNumber) %>%
+    summarise(!!sym(new_col) := case_when(sum(get(paste0("side_", i))) > 0 ~ 1,
+                                       TRUE ~ 0))
+  data_2 <- data_2 %>%
+    left_join(temp, by = c("ClaimNumber"))
+  
+  rm(temp)
+}
+
+
+
+# Join back item list
+for (i in item_list){
+  new_col <- paste0("item_", i)
+  
+  temp <- tidy_clm_unigram_1 %>%
+    group_by(ClaimNumber) %>%
+    summarise(!!sym(new_col) := case_when(sum(get(paste0("item_", i))) > 0 ~ 1,
+                                       TRUE ~ 0))
+  data_2 <- data_2 %>%
+    left_join(temp, by = c("ClaimNumber"))
+  
+  rm(temp)
+}
+
+# Join back injury case
+for (i in injury_cause_list){
+  new_col <- paste0("injury_cause_", i)
+  
+  temp <- tidy_clm_unigram_1 %>%
+    group_by(ClaimNumber) %>%
+    summarise(!!sym(new_col) := case_when(sum(get(paste0("injury_cause_", i))) > 0 ~ 1,
+                                       TRUE ~ 0))
+  data_2 <- data_2 %>%
+    left_join(temp, by = c("ClaimNumber"))
+  
+  rm(temp)
+}
+
+
+# Join back injury type
+injury_type_list <- c("strain", "sprain", "bruise", "twist", "cut", "fracture", "burn")
+
+# Join back injury type
+for (i in injury_type_list){
+  new_col <- paste0("injury_type_", i)
+  
+  temp <- tidy_clm_unigram_1 %>%
+    group_by(ClaimNumber) %>%
+    summarise(!!sym(new_col) := case_when(sum(get(paste0("injury_type_", i))) > 0 ~ 1,
+                                       TRUE ~ 0))
+  data_2 <- data_2 %>%
+    left_join(temp, by = c("ClaimNumber"))
+  
+  rm(temp)
+}
+
+
+
+beep("treasure")
+
+```
+
+
+```{r}
+# use gather function to covert the one-hot coding into the necessary columns
+# note that the conversion splits into two steps
+# the reason to split into two steps is because if this is done in one steps, there will be duplicated records
+# the code below first gather single injury types
+data_3_singleInjury <- data_2 %>%
+  mutate(sum_injury = rowSums(across(contains("body_")))) %>%
+  gather(injury_body, flag, body_back:body_head) %>%
+  filter(flag == 1 & sum_injury == 1) %>%
+  dplyr::select(-flag) %>%
+  mutate(injury_body = str_replace(injury_body, "body_", ""))
+
+# the code below gathers the remaining types
+data_3_multipleInjury <- data_2 %>%
+  mutate(sum_injury = rowSums(across(contains("body_")))) %>%
+  filter(sum_injury != 1) %>%
+  mutate(injury_body = case_when(sum_injury > 1 ~ "multiple",
+                                 TRUE ~ "others")) %>%
+  dplyr::select(-contains("body_"))
+
+# bind the rows
+data_3 <- bind_rows(data_3_singleInjury, data_3_multipleInjury)
+rm(data_3_singleInjury, data_3_multipleInjury)
+
+
+# replicated for other listing
+
+# side list
+data_3_singleside <- data_3 %>%
+  mutate(sum_side = rowSums(across(contains("side_")))) %>%
+  gather(injury_side, flag, side_left:side_upper) %>%
+  filter(flag == 1 & sum_side == 1) %>%
+  dplyr::select(-flag) %>%
+  mutate(injury_side = str_replace(injury_side, "side_", ""))
+
+# the code below gathers the remaining types
+data_3_multipleside <- data_3 %>%
+  mutate(sum_side = rowSums(across(contains("side_")))) %>%
+  filter(sum_side != 1) %>%
+  mutate(injury_side = case_when(sum_side > 1 ~ "multiple",
+                                 TRUE ~ "others")) %>%
+  dplyr::select(-contains("side_"))
+
+# bind the rows
+data_3 <- bind_rows(data_3_singleside, data_3_multipleside)
+rm(data_3_singleside, data_3_multipleside)
+
+
+
+# item list
+data_3_singleitem <- data_3 %>%
+  mutate(sum_item = rowSums(across(contains("item_")))) %>%
+  gather(injury_item, flag, item_knife:item_vehicle) %>%
+  filter(flag == 1 & sum_item == 1) %>%
+  dplyr::select(-flag) %>%
+  mutate(injury_item = str_replace(injury_item, "item_", ""))
+
+# the code below gathers the remaining types
+data_3_multipleitem <- data_3 %>%
+  mutate(sum_item = rowSums(across(contains("item_")))) %>%
+  filter(sum_item != 1) %>%
+  mutate(injury_item = case_when(sum_item > 1 ~ "multiple",
+                                 TRUE ~ "others")) %>%
+  dplyr::select(-contains("item_"))
+
+# bind the rows
+data_3 <- bind_rows(data_3_singleitem, data_3_multipleitem)
+rm(data_3_singleitem, data_3_multipleitem)
+
+
+# injury cause
+data_3_singleinjurycause <- data_3 %>%
+  mutate(sum_injurycause = rowSums(across(contains("injury_cause_")))) %>%
+  gather(injury_cause, flag, injury_cause_lifting:injury_cause_repetitive) %>%
+  filter(flag == 1 & sum_injurycause == 1) %>%
+  dplyr::select(-flag) %>%
+  mutate(injury_cause = str_replace(injury_cause, "injury_cause_", ""))
+
+# the code below gathers the remaining types
+data_3_multipleinjurycause <- data_3 %>%
+  mutate(sum_injurycause = rowSums(across(contains("injury_cause_")))) %>%
+  filter(sum_injurycause != 1) %>%
+  mutate(injury_cause = case_when(sum_injurycause > 1 ~ "multiple",
+                                 TRUE ~ "others")) %>%
+  dplyr::select(-contains("injury_cause_"))
+
+# bind the rows
+data_3 <- bind_rows(data_3_singleinjurycause, data_3_multipleinjurycause)
+rm(data_3_singleinjurycause, data_3_multipleinjurycause)
+
+
+# injury type
+data_3_singleinjurytype <- data_3 %>%
+  mutate(sum_injurytype = rowSums(across(contains("injury_type_")))) %>%
+  gather(injury_type, flag, injury_type_strain:injury_type_burn) %>%
+  filter(flag == 1 & sum_injurytype == 1) %>%
+  dplyr::select(-flag) %>%
+  mutate(injury_type = str_replace(injury_type, "injury_type_", ""))
+
+# the code below gathers the remaining types
+data_3_multipleinjurytype <- data_3 %>%
+  mutate(sum_injurytype = rowSums(across(contains("injury_type_")))) %>%
+  filter(sum_injurytype != 1) %>%
+  mutate(injury_type = case_when(sum_injurytype > 1 ~ "multiple",
+                                 TRUE ~ "others")) %>%
+  dplyr::select(-contains("injury_type_"))
+
+# bind the rows
+data_3 <- bind_rows(data_3_singleinjurytype, data_3_multipleinjurytype) %>%
+  dplyr::select(-c(sum_injury,
+                   sum_item,
+                   sum_injurycause,
+                   sum_injurytype,
+                   sum_side))
+
+rm(data_3_singleinjurytype, data_3_multipleinjurytype)
+
+
+```
+
+
+## 2.5    Feature Selection
+
+
+### 2.5.1   Frequency Count Plot
+
+#### 2.5.1.1   Target Variable
+
+```{r}
+ggplot(data_3, aes(init_ult_diff)) +
+  geom_histogram(stat = "bin")
+
+```
+
+
+#### 2.5.1.2   Plot out for all numeric variables
+
+```{r}
+num_var_list <- data_3 %>%
+  dplyr::select(where(is.numeric),
+                -init_ult_diff) %>%
+  names()
+
+```
+
+
+```{r}
+for (i in num_var_list){
+  print(ggplot(data_3, aes(!!sym(i))) +
+          geom_histogram(stat = "bin") +
+          labs(title = sym(i)) +
+          theme_minimal())
+}
+
+```
+
+
+Plot the continuous variables against target variable (ie. init_ult_diff)
+
+```{r}
+for (i in num_var_list){
+  print(ggplot(data_3, aes(x = !!sym(i), y = init_ult_diff)) +
+          geom_point(alpha = 0.1) +
+          labs(title = sym(i)) +
+          theme_minimal())
+}
+
+```
+
+
+
+#### 2.5.1.2   Plot out for all categorical variables
+
+```{r}
+cat_var_list <- data_3 %>%
+  dplyr::select(!where(is.numeric),
+                -c(ClaimNumber, DateTimeOfAccident, DateReported, ClaimDescription)) %>%
+  names()
+
+
+```
+
+
+```{r}
+for (i in cat_var_list){
+  print(ggplot(data_3, aes(!!sym(i))) +
+          geom_histogram(stat = "count") +
+          labs(title = sym(i)) +
+          theme_minimal())
+}
+
+```
+
+
+Plot the categorical variables against target variable (ie. init_ult_diff)
+
+```{r}
+for (i in cat_var_list){
+  print(ggplot(data_3, aes(x = !!sym(i), y = init_ult_diff)) +
+          geom_boxplot() +
+          labs(title = sym(i)) +
+          theme_minimal())
+}
+
+```
+
+
+### 2.5.2   Relationship between continuous target variable and categorical input variables
+
+
+```{r}
+summary(aov(init_ult_diff ~ acc_mth, data = data_3))
+
+```
+
+
+
+```{r}
+cat_var_list_2 <- data_3 %>%
+  dplyr::select(!where(is.numeric),
+                -c(ClaimNumber, DateTimeOfAccident, DateReported, ClaimDescription, acc_yr, report_yr)) %>%
+  names()
+
+
+
+for (i in cat_var_list_2){
+  assign(paste0("graph_clmdiff_", i),
+         ggbetweenstats(data_3,
+                        x = !!sym(i),
+                        y = init_ult_diff,
+                        pairwise.comparisons = TRUE,
+                        title = paste0("ANOVA Test on ", i," vs init_ult_diff"),
+                        ggtheme = ggplot2::theme(axis.text.x = element_text(angle = 90)),
+                        package = "RColorBrewer",
+                        palette = "Set3"))
+  
+  print(get(paste0("graph_clmdiff_", i)))
+}
+
+```
+
+
+
+### 2.5.3   Relationship between continuous target variable and continuous input variables
+
+Correlation
+
+
+```{r}
+data_1_num <- data_1 %>%
+  dplyr::select(where(is.numeric))
+
+```
+
+
+```{r}
+corrplot(cor(data_1_num, use="pairwise.complete.obs"), 
+         method = "number", 
+         type = "upper", 
+         tl.cex = 0.65, 
+         number.cex = 0.65, 
+         diag = FALSE)
+
+```
+
+The correlation between numeric variables and outcome is rather weak.
+
+
+
+
+
+```{}
+write_csv(data_3, "data/data_eda_actLoss_3.csv")
+
+beep("mario")
+
+```
+
+
+
+```{r save the results}
+#save.image(file = "data/MITBCapstone_Jasper_actLoss.RData")
+#load(file = "data/MITBCapstone_Jasper_actLoss.RData")
+
+```
+
